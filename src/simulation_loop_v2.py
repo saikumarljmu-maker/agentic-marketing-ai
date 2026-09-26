@@ -1,7 +1,7 @@
 """
-Full Replay Simulation V2 — Portfolio Manager with Policy Comparison
-Compares: logged_mix, uniform, rule_based, thompson_sampling, llm_portfolio
-Uses corrected data with no leakage, real calendar days, correct conversions.
+Replay Simulation V2 — fixed version.
+Fixes: true oracle, CTR in view, real CI, shared RNG, temperature=0,
+       inclusive day range 7-23, crash guard, lag ablation support.
 """
 
 import json
@@ -22,9 +22,8 @@ LOGS_PATH = Path("logs")
 RESULTS_PATH.mkdir(exist_ok=True)
 LOGS_PATH.mkdir(exist_ok=True)
 
-# Conversion lag note for LLM
 LAG_NOTE = (
-    "Conversion lag warning: conversions from the last 3 days are "
+    "\nConversion lag warning: conversions from the last 3 days are "
     "underreported by approximately 30-50% as many have not yet been "
     "attributed. Do not penalise recently-started campaigns for low "
     "conversion counts due to this lag effect."
@@ -32,128 +31,119 @@ LAG_NOTE = (
 
 
 class ReplaySimulationV2:
-    """
-    Full replay simulation comparing all policies on the same data.
-    Budget fractions tested: 1/2, 1/4, 1/8 of logged spend.
-    """
 
-    def __init__(self, n_seeds=3, use_llm=True):
+    def __init__(self, n_seeds=3, use_llm=True,
+                 lag_note=LAG_NOTE, run_name="v2"):
         self.n_seeds = n_seeds
         self.use_llm = use_llm
+        self.lag_note = lag_note
+        self.run_name = run_name
         self.observer = ObserverAgentV2()
         self.allocator = PortfolioAllocator()
         self.llm_agent = PortfolioStrategyAgent() if use_llm else None
         self.daily_cost = None
         self.conversions = None
         self.results = []
-        self.llm_decisions = []
+        self.run_meta = []
+        self._llm_cache = {}
 
     def setup(self):
-        """Load corrected data."""
         logger.info("=== Replay Simulation V2 Setup ===")
-        init = self.observer.initialise()
+        self.observer.initialise()
         self.daily_cost = self.observer.daily_cost
         self.conversions = self.observer.conversions
-
-        # Use days 0-23 (exclude last 7 for conversion lag)
         max_day = self.daily_cost["day"].max()
-        self.eval_days = list(range(7, max_day - 7))
-        logger.info(
-            f"Evaluation days: {self.eval_days[0]} to {self.eval_days[-1]} "
-            f"({len(self.eval_days)} days)"
-        )
-        return init
+        # Inclusive: days 7 to 23 = 17 days
+        self.eval_days = list(range(7, min(24, max_day - 6)))
+        logger.info(f"Evaluation days: {self.eval_days[0]} to "
+                    f"{self.eval_days[-1]} ({len(self.eval_days)} days)")
 
     def run_day(self, day, budget_fraction, seed):
-        """Run one day of replay for all policies."""
-        # Get observable view (no future leakage)
         view = observable_view(
             self.daily_cost, self.conversions,
             decision_day=day, window=7
         )
-
         if view.empty:
             return None
 
-        # Today's logged spend as budget
         today_logged = self.daily_cost[
-            self.daily_cost["day"] == day
-        ]["cost"].sum()
-
+            self.daily_cost["day"] == day]["cost"].sum()
         if today_logged <= 0:
             return None
 
         budget = today_logged * budget_fraction
 
-        # Ground truth for evaluation
+        # TRUE oracle: uses TODAY's actual logged cost as capacity
         truth = realised_outcomes(self.daily_cost, self.conversions, day)
-
         if truth.empty:
             return None
 
-        # Hindsight oracle allocation
         oracle_rate = (
             truth["conversions"] /
             truth["logged_cost"].replace(0, np.nan)
         ).fillna(0)
 
-        rng = np.random.default_rng(seed)
-        cap = view.set_index("campaign")["last_day_cost"]
-
         def oracle_alloc():
+            cap = truth["logged_cost"]  # today's true capacity
             alloc = pd.Series(0.0, index=cap.index)
             remaining = budget
             for c in oracle_rate.sort_values(ascending=False).index:
-                if c not in cap.index or remaining <= 0:
-                    continue
+                if remaining <= 0:
+                    break
                 take = min(float(cap.get(c, 0)), remaining)
                 alloc[c] = take
                 remaining -= take
             return alloc
 
-        # Get all policy allocations
-        baselines = self.allocator.get_baseline_allocations(view, budget, seed)
+        baselines = self.allocator.get_baselines(view, budget, seed)
         baselines["hindsight_oracle"] = oracle_alloc()
 
-        # LLM portfolio allocation
+        # LLM — called once per (day, budget_fraction), reused across seeds
+        meta = {"day": day, "budget_fraction": budget_fraction,
+                "seed": seed, "fallback": False, "success": True}
+
         if self.use_llm and self.llm_agent:
+            cache_key = f"{day}_{budget_fraction}"
             strategy = self.llm_agent.get_strategy(
-                day=day, view_df=view,
-                budget=budget, lag_note=LAG_NOTE
+                day=day, view_df=view, budget=budget,
+                lag_note=self.lag_note,
+                cache=self._llm_cache, cache_key=cache_key
             )
-            llm_alloc = self.allocator.allocate(view, budget, strategy, seed)
-            baselines["llm_portfolio"] = llm_alloc
-            strategy["budget_fraction"] = budget_fraction
-            strategy["seed"] = seed
-            self.llm_decisions.append(strategy)
+            try:
+                llm_alloc = self.allocator.allocate(view, budget, strategy, seed)
+                baselines["llm_portfolio"] = llm_alloc
+                meta["fallback"] = strategy.get("fallback", False)
+                meta["strategy"] = strategy.get("strategy")
+                meta["escalate"] = strategy.get("escalate_to_human")
+                meta["confidence"] = strategy.get("confidence")
+            except Exception as e:
+                logger.error(f"Allocator failed Day {day}: {e}")
+                baselines["llm_portfolio"] = baselines["thompson_sampling"].copy()
+                meta["success"] = False
+                meta["error"] = str(e)
         else:
             baselines["llm_portfolio"] = baselines["thompson_sampling"].copy()
+
+        self.run_meta.append(meta)
 
         # Evaluate each policy
         day_results = {}
         for policy_name, alloc in baselines.items():
-            # Replay: scale conversions proportionally to spend
-            conv_sum = 0
-            spend_sum = 0
-            unspent = 0
-
+            conv_sum = spend_sum = unspent = 0
             for camp in alloc.index:
                 if camp not in truth.index:
+                    unspent += float(alloc.get(camp, 0))
                     continue
                 logged_spend = float(truth.loc[camp, "logged_cost"])
                 logged_conv = float(truth.loc[camp, "conversions"])
                 policy_spend = float(alloc.get(camp, 0))
-
                 if logged_spend <= 0:
+                    unspent += policy_spend
                     continue
-
                 if policy_spend <= logged_spend:
-                    # Scale conversions proportionally
-                    scale = policy_spend / logged_spend
-                    conv_sum += logged_conv * scale
+                    conv_sum += logged_conv * (policy_spend / logged_spend)
                     spend_sum += policy_spend
                 else:
-                    # Cannot spend above logged — cap at logged
                     conv_sum += logged_conv
                     spend_sum += logged_spend
                     unspent += policy_spend - logged_spend
@@ -165,13 +155,9 @@ class ReplaySimulationV2:
                 "unspent": round(unspent, 4)
             }
 
-        # Oracle for % comparison
         oracle_conv = day_results.get("hindsight_oracle", {}).get("conversions", 1)
-
         return {
-            "day": day,
-            "budget_fraction": budget_fraction,
-            "seed": seed,
+            "day": day, "budget_fraction": budget_fraction, "seed": seed,
             "logged_spend": round(float(today_logged), 4),
             "budget": round(float(budget), 4),
             "policies": day_results,
@@ -179,19 +165,15 @@ class ReplaySimulationV2:
         }
 
     def run(self, budget_fractions=None):
-        """Run full simulation across all days, budgets, and seeds."""
         if budget_fractions is None:
             budget_fractions = [0.5, 0.25, 0.125]
 
-        logger.info("=== Starting Replay Simulation V2 ===")
-        start_time = datetime.now()
         self.setup()
-        logger.info(
-            f"Days: {len(self.eval_days)} | "
-            f"Budget fractions: {budget_fractions} | "
-            f"Seeds: {self.n_seeds} | "
-            f"LLM: {self.use_llm}"
-        )
+        logger.info(f"=== Starting Replay Simulation — run_name={self.run_name} ===")
+        logger.info(f"Days: {len(self.eval_days)} | "
+                    f"Budgets: {budget_fractions} | Seeds: {self.n_seeds}")
+
+        start_time = datetime.now()
 
         for day in self.eval_days:
             for bf in budget_fractions:
@@ -201,18 +183,15 @@ class ReplaySimulationV2:
                         if result:
                             self.results.append(result)
                     except Exception as e:
-                        logger.error(f"Day {day} bf={bf} seed={seed} failed: {e}")
-
+                        logger.error(
+                            f"Day {day} bf={bf} seed={seed} failed: {e}"
+                        )
             if day % 5 == 0:
-                logger.info(
-                    f"Progress: Day {day}/{self.eval_days[-1]} | "
-                    f"Results: {len(self.results)}"
-                )
+                logger.info(f"Progress: Day {day}/{self.eval_days[-1]}")
 
         return self._finalise(start_time)
 
     def _finalise(self, start_time):
-        """Aggregate results and save."""
         logger.info("=== Finalising Results ===")
 
         df = pd.DataFrame([
@@ -234,78 +213,54 @@ class ReplaySimulationV2:
             df["conversions"] / df["oracle_conversions"] * 100
         ).round(2)
 
-        # Summary by policy and budget fraction
-        summary = df.groupby(["policy", "budget_fraction"]).agg(
-            mean_conversions=("conversions", "mean"),
-            mean_cpa=("cpa", "mean"),
-            mean_pct_oracle=("pct_of_oracle", "mean"),
-            total_conversions=("conversions", "sum"),
-            n_days=("day", "count")
-        ).round(4)
+        run = self.run_name
+        df.to_parquet(RESULTS_PATH / f"replay_results_{run}.parquet", index=False)
 
-        print("\n" + "="*80)
-        print("REPLAY SIMULATION V2 — RESULTS SUMMARY")
-        print("="*80)
-        print("\nMean % of Hindsight Oracle by Policy and Budget Fraction:")
-        print("-"*80)
+        # Save run metadata
+        with open(RESULTS_PATH / f"run_meta_{run}.json", "w") as f:
+            json.dump(self.run_meta, f, indent=2)
 
-        pivot = df.groupby(["policy", "budget_fraction"])[
-            "pct_of_oracle"
-        ].mean().round(2).unstack()
-        print(pivot.to_string())
-
-        print("\nMean Conversions per Day:")
-        print("-"*80)
-        conv_pivot = df.groupby(["policy", "budget_fraction"])[
-            "conversions"
-        ].mean().round(2).unstack()
-        print(conv_pivot.to_string())
-
-        # Save results
-        df.to_parquet(RESULTS_PATH / "replay_results_v2.parquet", index=False)
-
-        summary_dict = summary.reset_index().to_dict("records")
-        with open(RESULTS_PATH / "replay_summary_v2.json", "w") as f:
-            json.dump(summary_dict, f, indent=2)
-
-        if self.llm_decisions:
-            with open(LOGS_PATH / "llm_portfolio_decisions.jsonl", "w") as f:
-                for d in self.llm_decisions:
-                    f.write(json.dumps(d) + "\n")
-
+        # Save LLM decisions
+        if self.llm_agent and self.llm_agent.decisions:
+            self.llm_agent.save(run_name=run)
             total_cost = sum(
-                d.get("cost_usd", 0) for d in self.llm_decisions
+                d.get("cost_usd", 0) for d in self.llm_agent.decisions
             )
             logger.info(f"Total LLM cost: ${round(total_cost, 4)}")
 
+        # Print summary
+        print("\n" + "="*80)
+        print(f"REPLAY SIMULATION V2 — {run.upper()} RESULTS")
+        print("="*80)
+        print("\nMean % of Hindsight Oracle:")
+        pivot = df.groupby(["policy", "budget_fraction"])[
+            "pct_of_oracle"].mean().round(2).unstack()
+        print(pivot.to_string())
+
+        print("\nMean Conversions per Day:")
+        conv_pivot = df.groupby(["policy", "budget_fraction"])[
+            "conversions"].mean().round(2).unstack()
+        print(conv_pivot.to_string())
+
         duration = (datetime.now() - start_time).total_seconds()
         logger.success(
-            f"Simulation complete in {duration:.0f}s | "
-            f"{len(self.results)} day-budget-seed combinations"
+            f"Done in {duration:.0f}s | "
+            f"{len(self.results)} results | "
+            f"run={run}"
         )
 
         return {
-            "summary": summary_dict,
             "total_results": len(self.results),
-            "policies_compared": list(df["policy"].unique()),
-            "budget_fractions": list(df["budget_fraction"].unique()),
+            "policies": list(df["policy"].unique()),
+            "run_name": run,
             "duration_seconds": round(duration, 1)
         }
 
 
 if __name__ == "__main__":
-    logger.info("Starting Full Replay Simulation V2...")
-    logger.info("This will take approximately 15-20 minutes")
-    logger.info("Comparing: logged_mix, uniform, rule_based, thompson, llm_portfolio, oracle")
+    logger.info("Starting Replay Simulation V2 (fixed)...")
 
-    sim = ReplaySimulationV2(n_seeds=3, use_llm=True)
-    results = sim.run(budget_fractions=[0.5, 0.25, 0.125])
-
-    print("\n=== POLICIES COMPARED ===")
-    for p in results["policies_compared"]:
-        print(f"  - {p}")
-
-    print(f"\nTotal results: {results['total_results']}")
-    print(f"Duration: {results['duration_seconds']}s")
-    print("\n✅ Replay simulation complete!")
-    print("Results saved to results/replay_results_v2.parquet")
+    # Main run — with lag note
+    sim = ReplaySimulationV2(n_seeds=3, use_llm=True,
+                              lag_note=LAG_NOTE, run_name="v2")
+    sim.run(budget_fractions=[0.5, 0.25, 0.125])
