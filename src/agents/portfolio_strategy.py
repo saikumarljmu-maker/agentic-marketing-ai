@@ -1,10 +1,7 @@
 """
-Portfolio Strategy Agent — v2 fixes applied.
-- temperature=0 for reproducibility
-- Real 90% credible CPA interval
-- CTR now shown correctly
-- Unknown campaign IDs ignored safely
-- Thompson uses same RNG seed as LLM allocator
+Portfolio Strategy Agent — Round 3 fixes.
+CI is now deterministic Gamma-posterior quantiles (scipy).
+budget_fraction stored with each decision.
 """
 
 import json
@@ -16,9 +13,9 @@ import os
 import anthropic
 import pandas as pd
 import numpy as np
+from scipy import stats as scipy_stats
 
 load_dotenv()
-
 LOGS_PATH = Path("logs")
 LOGS_PATH.mkdir(exist_ok=True)
 
@@ -34,30 +31,39 @@ class PortfolioStrategyAgent:
         self.model = "claude-sonnet-4-6"
         self.top_n = top_n
         self.decisions = []
-        logger.success("Portfolio Strategy Agent initialised (temperature=0)")
+        logger.success("Portfolio Strategy Agent initialised (temperature=0, deterministic CI)")
 
-    def _build_prompt(self, day, view_df, budget, lag_note):
+    def _credible_interval(self, conv, cost, pooled_rate, alpha=0.10):
+        """
+        True 90% credible interval for CPA using Gamma-Poisson posterior.
+        Deterministic — no random draws.
+        """
+        prior_cost = 1.0 / max(pooled_rate, 1e-12)
+        a = 1.0 + conv
+        b = prior_cost + cost
+        # Rate posterior: Gamma(a, 1/b)
+        # CPA = 1/rate -> inverse-Gamma quantiles
+        rate_hi = scipy_stats.gamma.ppf(1 - alpha/2, a=a, scale=1.0/b)
+        rate_lo = scipy_stats.gamma.ppf(alpha/2, a=a, scale=1.0/b)
+        cpa_lo = 1.0/rate_hi if rate_hi > 0 else np.inf
+        cpa_hi = 1.0/rate_lo if rate_lo > 0 else np.inf
+        return round(float(cpa_lo), 4), round(float(cpa_hi), 4)
+
+    def _build_prompt(self, day, view_df, budget, lag_note, budget_fraction=None):
         v = view_df.copy().sort_values("known_conversions", ascending=False)
+        pooled_rate = (v["known_conversions"].sum() /
+                       max(v["cost"].sum(), 1e-12))
 
         rows = []
         for _, row in v.head(self.top_n).iterrows():
             conv = int(row["known_conversions"])
             cost = round(float(row["cost"]), 4)
-            cpa_val = round(float(row["cpa"]), 4) if pd.notna(row["cpa"]) and row["cpa"] > 0 else "N/A"
-            ctr_val = round(float(row["ctr"]), 4) if pd.notna(row.get("ctr", 0)) else 0.0
+            cpa_val = round(float(row["cpa"]), 4) if pd.notna(row.get("cpa")) and row["cpa"] > 0 else "N/A"
+            ctr_val = round(float(row.get("ctr", 0)), 4) if pd.notna(row.get("ctr", 0)) else 0.0
 
-            # Real 90% credible interval from Gamma-Poisson posterior
             if conv > 0 and cost > 0:
-                pooled = v["known_conversions"].sum() / max(v["cost"].sum(), 1e-12)
-                prior_cost = 1.0 / max(pooled, 1e-12)
-                a = 1.0 + conv
-                b = prior_cost + cost
-                # CPA interval: cost/rate
-                rate_low = np.random.gamma(a, 1.0/b) * 1.05
-                rate_high = np.random.gamma(a, 1.0/b) * 0.95
-                ci_low = round(cost / max(rate_low * cost, 1e-12), 4)
-                ci_high = round(cost / max(rate_high * cost, 1e-12), 4)
-                ci = f"[{min(ci_low,ci_high):.4f}-{max(ci_low,ci_high):.4f}]"
+                ci_lo, ci_hi = self._credible_interval(conv, cost, pooled_rate)
+                ci = f"[{ci_lo:.4f}-{ci_hi:.4f}]"
             else:
                 ci = "[unknown]"
 
@@ -73,6 +79,7 @@ class PortfolioStrategyAgent:
         total_conv = int(v["known_conversions"].sum())
         zero_conv = int((v["known_conversions"] == 0).sum())
         active = int((v["cost"] > 0).sum())
+        bf_str = f" (budget fraction: {budget_fraction})" if budget_fraction else ""
 
         prompt = f"""You are a digital marketing portfolio manager for Day {day}.
 
@@ -80,7 +87,7 @@ PORTFOLIO SUMMARY:
 - Total campaigns: {len(v)} ({active} active, {zero_conv} with zero known conversions)
 - Total spend last 7 days: {total_spend}
 - Total known conversions: {total_conv}
-- Available budget today: {round(budget, 4)}
+- Available budget today: {round(budget, 4)}{bf_str}
 {lag_note}
 
 TOP {self.top_n} CAMPAIGNS (by known conversions):
@@ -88,7 +95,7 @@ CampID: spend, conversions, CPA, CTR, 90pct_CPA_credible_interval
 {portfolio_text}
 
 Set STRATEGY PARAMETERS for the budget allocator.
-Use INTEGER campaign IDs only (e.g. 9100693 not "Camp 9100693").
+Use INTEGER campaign IDs only (e.g. 9100693).
 
 Respond ONLY with this JSON (no markdown):
 {{
@@ -110,14 +117,16 @@ Respond ONLY with this JSON (no markdown):
         except (ValueError, TypeError):
             return None
 
-    def get_strategy(self, day, view_df, budget, lag_note="", cache=None, cache_key=None):
-        """Get LLM strategy. Uses cache if provided to avoid duplicate API calls."""
+    def get_strategy(self, day, view_df, budget, lag_note="",
+                     cache=None, cache_key=None, budget_fraction=None):
         if cache is not None and cache_key and cache_key in cache:
             logger.info(f"Day {day}: using cached strategy")
-            return cache[cache_key]
+            cached = dict(cache[cache_key])
+            cached["budget_fraction"] = budget_fraction
+            return cached
 
         logger.info(f"Portfolio Strategy Agent — Day {day}")
-        prompt = self._build_prompt(day, view_df, budget, lag_note)
+        prompt = self._build_prompt(day, view_df, budget, lag_note, budget_fraction)
 
         try:
             start = time.time()
@@ -128,7 +137,6 @@ Respond ONLY with this JSON (no markdown):
                 messages=[{"role": "user", "content": prompt}]
             )
             duration = round(time.time() - start, 2)
-
             text = response.content[0].text.strip()
             if "```" in text:
                 text = text.split("```")[1]
@@ -136,8 +144,6 @@ Respond ONLY with this JSON (no markdown):
                     text = text[4:]
 
             strategy = json.loads(text)
-
-            # Safely parse campaign IDs
             strategy["protect_campaigns"] = [
                 v for v in (self._parse_id(x)
                 for x in strategy.get("protect_campaigns", [])) if v is not None
@@ -146,8 +152,8 @@ Respond ONLY with this JSON (no markdown):
                 v for v in (self._parse_id(x)
                 for x in strategy.get("exclude_campaigns", [])) if v is not None
             ]
-
             strategy["day"] = day
+            strategy["budget_fraction"] = budget_fraction
             strategy["duration_seconds"] = duration
             strategy["input_tokens"] = response.usage.input_tokens
             strategy["output_tokens"] = response.usage.output_tokens
@@ -161,7 +167,6 @@ Respond ONLY with this JSON (no markdown):
                 cache[cache_key] = strategy
 
             self.decisions.append(strategy)
-
             logger.success(
                 f"Day {day}: {strategy.get('strategy')} | "
                 f"protect={len(strategy.get('protect_campaigns',[]))} | "
@@ -173,14 +178,15 @@ Respond ONLY with this JSON (no markdown):
 
         except json.JSONDecodeError as e:
             logger.warning(f"Day {day} JSON parse failed: {e}")
-            return self._fallback(day)
+            return self._fallback(day, budget_fraction)
         except Exception as e:
             logger.error(f"Day {day} strategy failed: {e}")
-            return self._fallback(day)
+            return self._fallback(day, budget_fraction)
 
-    def _fallback(self, day):
+    def _fallback(self, day, budget_fraction=None):
         strat = {
-            "day": day, "strategy": "balanced",
+            "day": day, "budget_fraction": budget_fraction,
+            "strategy": "balanced",
             "protect_campaigns": [], "exclude_campaigns": [],
             "focus_on_conversions": True, "escalate_to_human": False,
             "escalation_reason": None, "confidence": "low",
@@ -223,14 +229,8 @@ class PortfolioAllocator:
     def allocate(self, view_df, budget, strategy_params, seed=42):
         rng = np.random.default_rng(seed)
         v = view_df.set_index("campaign").copy()
-
-        exclude = set(strategy_params.get("exclude_campaigns", []))
-        protect = set(strategy_params.get("protect_campaigns", []))
-
-        # Filter to only valid campaign IDs
-        exclude = exclude & set(v.index)
-        protect = protect & set(v.index)
-
+        exclude = set(strategy_params.get("exclude_campaigns", [])) & set(v.index)
+        protect = set(strategy_params.get("protect_campaigns", [])) & set(v.index)
         strat = strategy_params.get("strategy", "balanced")
         mult = self.STRATEGY_MULTIPLIERS.get(strat, 1.0)
 
@@ -239,21 +239,17 @@ class PortfolioAllocator:
         a = 1.0 + v["known_conversions"]
         b = prior_cost + v["cost"]
         scores = pd.Series(
-            rng.gamma(a.values, 1.0 / b.values),
-            index=v.index
+            rng.gamma(a.values, 1.0 / b.values), index=v.index
         )
-
         scores[list(exclude)] = -np.inf
         if protect:
             scores[list(protect)] = scores.max() * 2
-
         if strategy_params.get("focus_on_conversions", True):
             converting = v[v["known_conversions"] > 0].index
             scores[converting] *= mult
 
         cap = v["last_day_cost"].copy()
         cap[list(exclude)] = 0.0
-
         return self._greedy(scores, cap, budget)
 
     def get_baselines(self, view_df, budget, seed=42):
@@ -262,16 +258,13 @@ class PortfolioAllocator:
         cap = v["last_day_cost"]
         allocations = {}
 
-        # Logged mix
         w = cap.clip(lower=0)
         allocations["logged_mix"] = w / w.sum() * budget if w.sum() > 0 else w
 
-        # Uniform
         allocations["uniform"] = self._greedy(
             pd.Series(rng.random(len(cap)), index=cap.index), cap, budget
         )
 
-        # Rule-based
         median_cpa = v["cpa"].median()
         dead = (v["known_conversions"] == 0) & (v["cost"] > 3.0 * median_cpa)
         rule_scores = -v["cpa"].fillna(np.inf)
@@ -280,7 +273,6 @@ class PortfolioAllocator:
             rule_scores, cap.where(~dead, 0.0), budget
         )
 
-        # Thompson — same RNG seed as LLM allocator
         rng2 = np.random.default_rng(seed)
         pooled = v["known_conversions"].sum() / max(v["cost"].sum(), 1e-12)
         prior_cost = 1.0 / max(pooled, 1e-12)

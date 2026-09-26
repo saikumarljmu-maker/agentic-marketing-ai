@@ -1,6 +1,7 @@
 """
-Corrected Criteo preparation — v2 fixes applied.
-observable_view now includes ctr column.
+Criteo preparation — Round 3 fixes.
+observable_view capacity uses full cost of most recent day
+(fixes chunk-boundary underestimation).
 """
 
 from pathlib import Path
@@ -40,7 +41,6 @@ def prepare(raw_path=RAW, out_dir=OUT, campaigns=None, n_campaigns=None,
             impressions=("timestamp", "size"),
             clicks=("click", "sum"),
             cost=("cost", "sum"),
-            last_day_cost=("cost", "sum")
         ).reset_index())
 
         att = chunk[(chunk["attribution"] == 1) & (chunk["conversion_id"] >= 0)].copy()
@@ -58,8 +58,7 @@ def prepare(raw_path=RAW, out_dir=OUT, campaigns=None, n_campaigns=None,
                   .groupby(["day", "campaign"], as_index=False)
                   .agg(impressions=("impressions", "sum"),
                        clicks=("clicks", "sum"),
-                       cost=("cost", "sum"),
-                       last_day_cost=("cost", "last"))
+                       cost=("cost", "sum"))
                   .sort_values(["day", "campaign"]))
 
     print("Aggregating conversions table...")
@@ -85,8 +84,9 @@ def prepare(raw_path=RAW, out_dir=OUT, campaigns=None, n_campaigns=None,
 
 def observable_view(daily_cost, conversions, decision_day, window=7):
     """
-    What a manager could see at START of decision_day.
-    Now includes ctr column. No future information.
+    Leakage-safe view at START of decision_day.
+    Capacity = full cost of most recent day in window
+    (fixes chunk-boundary underestimation of last_day_cost).
     """
     lo, hi = decision_day - window, decision_day - 1
     c = daily_cost[(daily_cost["day"] >= lo) & (daily_cost["day"] <= hi)]
@@ -94,15 +94,20 @@ def observable_view(daily_cost, conversions, decision_day, window=7):
         cost=("cost", "sum"),
         clicks=("clicks", "sum"),
         impressions=("impressions", "sum"),
-        last_day_cost=("last_day_cost", "last")
     )
+    # Capacity: full cost of most recent day — sum all chunks for that day
+    most_recent_day = c[c["day"] == hi]
+    capacity = most_recent_day.groupby("campaign")["cost"].sum().rename("last_day_cost")
+
     k = conversions[
         (conversions["impression_day"] >= lo) &
         (conversions["impression_day"] <= hi) &
         (conversions["conversion_day"] < decision_day)
     ]
     known = k.groupby("campaign")["conversions"].sum().rename("known_conversions")
-    view = cost.join(known, how="left").fillna({"known_conversions": 0})
+    view = cost.join(capacity, how="left").join(known, how="left")
+    view["last_day_cost"] = view["last_day_cost"].fillna(0)
+    view["known_conversions"] = view["known_conversions"].fillna(0)
     view["cpa"] = view["cost"] / view["known_conversions"].replace(0, np.nan)
     view["ctr"] = view["clicks"] / view["impressions"].replace(0, np.nan)
     view = view.fillna({"ctr": 0.0})
@@ -111,7 +116,7 @@ def observable_view(daily_cost, conversions, decision_day, window=7):
 
 def realised_outcomes(daily_cost, conversions, day):
     """Ground truth for evaluation only."""
-    cost = daily_cost[daily_cost["day"] == day].set_index("campaign")["cost"]
+    cost = daily_cost[daily_cost["day"] == day].groupby("campaign")["cost"].sum()
     conv = (conversions[conversions["impression_day"] == day]
             .groupby("campaign")["conversions"].sum())
     return pd.DataFrame({"logged_cost": cost}).join(conv.rename("conversions")).fillna(0)

@@ -1,7 +1,7 @@
 """
-Replay Simulation V2 — fixed version.
-Fixes: true oracle, CTR in view, real CI, shared RNG, temperature=0,
-       inclusive day range 7-23, crash guard, lag ablation support.
+Replay Simulation V2 — Round 3 fixes.
+budget_fraction stored with LLM decisions.
+Fallbacks cached correctly.
 """
 
 import json
@@ -24,9 +24,8 @@ LOGS_PATH.mkdir(exist_ok=True)
 
 LAG_NOTE = (
     "\nConversion lag warning: conversions from the last 3 days are "
-    "underreported by approximately 30-50% as many have not yet been "
-    "attributed. Do not penalise recently-started campaigns for low "
-    "conversion counts due to this lag effect."
+    "underreported as many have not yet been attributed. "
+    "Do not penalise recently-started campaigns for low conversion counts."
 )
 
 
@@ -53,7 +52,6 @@ class ReplaySimulationV2:
         self.daily_cost = self.observer.daily_cost
         self.conversions = self.observer.conversions
         max_day = self.daily_cost["day"].max()
-        # Inclusive: days 7 to 23 = 17 days
         self.eval_days = list(range(7, min(24, max_day - 6)))
         logger.info(f"Evaluation days: {self.eval_days[0]} to "
                     f"{self.eval_days[-1]} ({len(self.eval_days)} days)")
@@ -72,8 +70,6 @@ class ReplaySimulationV2:
             return None
 
         budget = today_logged * budget_fraction
-
-        # TRUE oracle: uses TODAY's actual logged cost as capacity
         truth = realised_outcomes(self.daily_cost, self.conversions, day)
         if truth.empty:
             return None
@@ -84,7 +80,7 @@ class ReplaySimulationV2:
         ).fillna(0)
 
         def oracle_alloc():
-            cap = truth["logged_cost"]  # today's true capacity
+            cap = truth["logged_cost"]
             alloc = pd.Series(0.0, index=cap.index)
             remaining = budget
             for c in oracle_rate.sort_values(ascending=False).index:
@@ -98,7 +94,6 @@ class ReplaySimulationV2:
         baselines = self.allocator.get_baselines(view, budget, seed)
         baselines["hindsight_oracle"] = oracle_alloc()
 
-        # LLM — called once per (day, budget_fraction), reused across seeds
         meta = {"day": day, "budget_fraction": budget_fraction,
                 "seed": seed, "fallback": False, "success": True}
 
@@ -107,14 +102,15 @@ class ReplaySimulationV2:
             strategy = self.llm_agent.get_strategy(
                 day=day, view_df=view, budget=budget,
                 lag_note=self.lag_note,
-                cache=self._llm_cache, cache_key=cache_key
+                cache=self._llm_cache, cache_key=cache_key,
+                budget_fraction=budget_fraction
             )
             try:
                 llm_alloc = self.allocator.allocate(view, budget, strategy, seed)
                 baselines["llm_portfolio"] = llm_alloc
-                meta["fallback"] = strategy.get("fallback", False)
+                meta["fallback"] = bool(strategy.get("fallback", False))
                 meta["strategy"] = strategy.get("strategy")
-                meta["escalate"] = strategy.get("escalate_to_human")
+                meta["escalate"] = bool(strategy.get("escalate_to_human", False))
                 meta["confidence"] = strategy.get("confidence")
             except Exception as e:
                 logger.error(f"Allocator failed Day {day}: {e}")
@@ -126,7 +122,6 @@ class ReplaySimulationV2:
 
         self.run_meta.append(meta)
 
-        # Evaluate each policy
         day_results = {}
         for policy_name, alloc in baselines.items():
             conv_sum = spend_sum = unspent = 0
@@ -183,9 +178,7 @@ class ReplaySimulationV2:
                         if result:
                             self.results.append(result)
                     except Exception as e:
-                        logger.error(
-                            f"Day {day} bf={bf} seed={seed} failed: {e}"
-                        )
+                        logger.error(f"Day {day} bf={bf} seed={seed}: {e}")
             if day % 5 == 0:
                 logger.info(f"Progress: Day {day}/{self.eval_days[-1]}")
 
@@ -193,7 +186,6 @@ class ReplaySimulationV2:
 
     def _finalise(self, start_time):
         logger.info("=== Finalising Results ===")
-
         df = pd.DataFrame([
             {
                 "day": r["day"],
@@ -216,19 +208,14 @@ class ReplaySimulationV2:
         run = self.run_name
         df.to_parquet(RESULTS_PATH / f"replay_results_{run}.parquet", index=False)
 
-        # Save run metadata
         with open(RESULTS_PATH / f"run_meta_{run}.json", "w") as f:
             json.dump(self.run_meta, f, indent=2)
 
-        # Save LLM decisions
         if self.llm_agent and self.llm_agent.decisions:
             self.llm_agent.save(run_name=run)
-            total_cost = sum(
-                d.get("cost_usd", 0) for d in self.llm_agent.decisions
-            )
+            total_cost = sum(d.get("cost_usd", 0) for d in self.llm_agent.decisions)
             logger.info(f"Total LLM cost: ${round(total_cost, 4)}")
 
-        # Print summary
         print("\n" + "="*80)
         print(f"REPLAY SIMULATION V2 — {run.upper()} RESULTS")
         print("="*80)
@@ -236,31 +223,21 @@ class ReplaySimulationV2:
         pivot = df.groupby(["policy", "budget_fraction"])[
             "pct_of_oracle"].mean().round(2).unstack()
         print(pivot.to_string())
-
         print("\nMean Conversions per Day:")
         conv_pivot = df.groupby(["policy", "budget_fraction"])[
             "conversions"].mean().round(2).unstack()
         print(conv_pivot.to_string())
 
         duration = (datetime.now() - start_time).total_seconds()
-        logger.success(
-            f"Done in {duration:.0f}s | "
-            f"{len(self.results)} results | "
-            f"run={run}"
-        )
+        logger.success(f"Done in {duration:.0f}s | {len(self.results)} results | run={run}")
 
-        return {
-            "total_results": len(self.results),
-            "policies": list(df["policy"].unique()),
-            "run_name": run,
-            "duration_seconds": round(duration, 1)
-        }
+        return {"total_results": len(self.results),
+                "policies": list(df["policy"].unique()),
+                "run_name": run, "duration_seconds": round(duration, 1)}
 
 
 if __name__ == "__main__":
-    logger.info("Starting Replay Simulation V2 (fixed)...")
-
-    # Main run — with lag note
+    logger.info("Starting Replay Simulation V2 (Round 3 fixes)...")
     sim = ReplaySimulationV2(n_seeds=3, use_llm=True,
                               lag_note=LAG_NOTE, run_name="v2")
     sim.run(budget_fractions=[0.5, 0.25, 0.125])
