@@ -158,7 +158,7 @@ agentic-marketing-ai/
 If you reference this work:
 
 ```
-<Your Name> (2026). Agentic AI for Autonomous Digital Marketing Campaign Management:
+Sai Kumar Matta (2026). Agentic AI for Autonomous Digital Marketing Campaign Management:
 A Retrospective Simulation Study Using Public Benchmark Datasets.
 MSc Data Science thesis, Liverpool John Moores University.
 ```
@@ -169,8 +169,8 @@ Supervisor: Dr Anukriti Bansal
 
 ## Author
 
-**<Your Name>**
-[LinkedIn](https://linkedin.com/in/<your-handle>) · <your-personal-email>
+**Sai Kumar Matta**
+[LinkedIn](https://linkedin.com/in/sai-kumar-m) · saikumar.matta@gmail.com
 
 ## License
 
